@@ -5,6 +5,9 @@ Main entrypoint module for the ccarto tool.
 """
 import argparse
 import boto3
+from botocore.exceptions import ClientError
+from itertools import count
+import json
 import logging
 
 from py_markdown_table.markdown_table import markdown_table
@@ -22,9 +25,14 @@ PARSER.add_argument("-f", "--filter",
                     help="Tags to filter on, format should be as follows: Key:Value",
                     nargs="+",
                     default=[])
-PARSER.add_argument("-o", "--output",
+PARSER.add_argument("--headers",
                     help="Output format for markdown table result, string separated",
                     default="StackName,LastUpdatedTime,Tags:owner,Tags:project,Template:Metadata.build info.built from.file,Region")
+PARSER.add_argument("-i", "--input",
+                    help="Skips json generation and AWS API calls and reads json directly for graph visualization, doesn't output markdown table")
+PARSER.add_argument("-o", "--output",
+                    help="Filename to output json graph data to",
+                    default="cloudformation_map.json")
 PARSER.add_argument("-v", "--verbose",
                     help="Print more information",
                     action="store_true",
@@ -35,6 +43,23 @@ logging.basicConfig(level=logging.INFO)
 if ARGS.verbose:
     logging.basicConfig(level=logging.DEBUG)
 
+RESOURCE_TYPE_MAPPING = {
+    "ApiGatewayV2": "https://icon.icepanel.io/AWS/svg/App-Integration/API-Gateway.svg",
+    "ApplicationAutoScaling": "https://icon.icepanel.io/AWS/svg/Compute/Application-Auto-Scaling.svg",
+    "CloudWatch": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudWatch.svg",
+    "DynamoDB": "https://icon.icepanel.io/AWS/svg/Database/DynamoDB.svg",
+    "EC2": "https://icon.icepanel.io/AWS/svg/Compute/EC2.svg",
+    "Events": "https://icon.icepanel.io/AWS/svg/App-Integration/EventBridge.svg",
+    "IAM": "https://icon.icepanel.io/AWS/svg/Security-Identity-Compliance/IAM-Identity-Center.svg",
+    "Lambda": "https://icon.icepanel.io/AWS/svg/Compute/Lambda.svg",
+    "Logs": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudWatch.svg",
+    "Route53": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudWatch.svg",
+    "S3": "https://icon.icepanel.io/AWS/svg/Storage/Simple-Storage-Service.svg",
+}
+
+GRAPH_NODE_ID_TO_STACK_MAPPING = {}
+NODE_ID_COUNTER = count()
+
 
 def list_stacks_by_tags(client, tags: dict, region: str) -> list:
     """
@@ -44,6 +69,7 @@ def list_stacks_by_tags(client, tags: dict, region: str) -> list:
     :param tags: A dictionary of tag keys and values to filter stacks (e.g., {"Environment": "Prod"}).
     :return: A list of stack names that match the tags.
     """
+    logging.info("Listing stacks in region '%s'", region)
     # Get all stacks (exclude deleted or otherwise non-existent stacks)
     paginator = client.get_paginator('list_stacks')
     response_iterator = paginator.paginate(
@@ -57,6 +83,7 @@ def list_stacks_by_tags(client, tags: dict, region: str) -> list:
 
     matching_stacks = []
 
+    logging.info("Processing stacks from region: '%s'", region)
     for page in response_iterator:
         for stack_summary in page['StackSummaries']:
             stack_name = stack_summary['StackName']
@@ -70,7 +97,45 @@ def list_stacks_by_tags(client, tags: dict, region: str) -> list:
 
             # Check if stack tags match the required tags
             if all(stack_tags_dict.get(k) == v for k, v in tags.items()):
+                all_resources = []
+                next_token = None
+                while True:
+                    if next_token:
+                        response = client.list_stack_resources(StackName=stack_name, NextToken=next_token)
+                    else:
+                        response = client.list_stack_resources(StackName=stack_name)
+                    all_resources.extend(response['StackResourceSummaries'])
+                    next_token = response.get('NextToken')
+                    if not next_token:
+                        break
+                stack_details['Stacks'][0]['Resources'] = all_resources
+
+                all_imports = {}
+                for output in stack_details['Stacks'][0].get("Outputs", []):
+                    export = output.get("ExportName", None)
+                    if not export:
+                        continue
+                    all_imports[export] = []
+                    next_token = None
+                    while True:
+                        try:
+                            if next_token:
+                                response = client.list_imports(ExportName=export, NextToken=next_token)
+                            else:
+                                response = client.list_imports(ExportName=export)
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'ValidationError':
+                                logging.debug(f"Export '{export}' is not imported by any stack")
+                                break
+                            else:
+                                raise e
+                        all_imports[export].extend(response['Imports'])
+                        next_token = response.get('NextToken')
+                        if not next_token:
+                            break
+                stack_details['Stacks'][0]['Imports'] = all_imports
                 stack_details['Stacks'][0]['Region'] = region
+
                 matching_stacks.append(stack_details['Stacks'][0])
                 logging.debug("Found matching stack %s with details '%s'", stack_name, stack_details)
 
@@ -93,6 +158,46 @@ def create_transformation_functions(outputs: list):
     return transformations
 
 
+def create_cfn_node(name: str, graph_data: dict) -> str:
+    node_id = f"s{next(NODE_ID_COUNTER)}"
+    GRAPH_NODE_ID_TO_STACK_MAPPING[name] = node_id
+    graph_data["nodes"].append(
+        {"id": node_id, "name": name, "image": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudFormation.svg", "type": "stack"}
+    )
+    return node_id
+
+def expand_stack_for_graph(stack, graph_data: dict) -> dict:
+    """Transform stack details to json for the stack and its resources."""
+    name = stack['StackName']
+    node_id = "s?"
+    if name not in GRAPH_NODE_ID_TO_STACK_MAPPING:
+        node_id = create_cfn_node(name, graph_data)
+    else:
+        # Node was already created when referenced previously via an import/export relation
+        node_id = GRAPH_NODE_ID_TO_STACK_MAPPING[name]
+
+    for resource_id, resource in enumerate(stack['Resources']):
+        resource_id = f"{node_id}-r{resource_id}"
+        logical_resource_id = resource['LogicalResourceId']
+        resource_type = RESOURCE_TYPE_MAPPING.get(resource['ResourceType'].split("::")[1], "https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg")
+        graph_data["nodes"].append(
+            {"id": resource_id, "name": logical_resource_id, "image": resource_type, "type": "resource"}
+        )
+        graph_data["links"].append(
+            {"source": resource_id, "target": node_id}
+        )
+
+    for export, import_stacks in stack['Imports'].items():
+        for import_stack in import_stacks:
+            if import_stack not in GRAPH_NODE_ID_TO_STACK_MAPPING:
+                imported_stack_node_id = create_cfn_node(import_stack, graph_data)
+            else:
+                imported_stack_node_id = GRAPH_NODE_ID_TO_STACK_MAPPING[import_stack]
+            graph_data["links"].append(
+                {"source": imported_stack_node_id, "target": node_id, "label": export}
+            )
+    return graph_data
+
 def main():
     """Entry point for the application script."""
     tags = {key: value for key, value in map(lambda f: f.split(":"), ARGS.filter)}
@@ -106,12 +211,18 @@ def main():
     stacks = sorted(stacks, key=lambda d: d['StackName'])
 
     # For each desired element in the output create a suitable transformation function
-    transformations = create_transformation_functions(ARGS.output.split(","))
+    graph_data = {"nodes": [], "links": []}
+    transformations = create_transformation_functions(ARGS.headers.split(","))
     table_data = []
     for stack in stacks:
+        expand_stack_for_graph(stack, graph_data)
         data = {key: value for transform in transformations for key, value in [transform(stack)]}
         logging.info(data)
         table_data.append(data)
+
+    # Output graph json
+    with open(ARGS.output, "w") as outfile:
+        outfile.write(json.dumps(graph_data))
 
     # Output markdown table
     markdown = markdown_table(table_data).get_markdown()
