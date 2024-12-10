@@ -6,9 +6,11 @@ Main entrypoint module for the ccarto tool.
 import argparse
 import boto3
 from botocore.exceptions import ClientError
+import functools
 from itertools import count
 import json
 import logging
+import yaml
 
 from py_markdown_table.markdown_table import markdown_table
 
@@ -27,7 +29,7 @@ PARSER.add_argument("-f", "--filter",
                     default=[])
 PARSER.add_argument("--headers",
                     help="Output format for markdown table result, string separated",
-                    default="StackName,LastUpdatedTime,Tags:owner,Tags:project,Template:Metadata.build info.built from.file,Region")
+                    default="StackName,LastUpdatedTime,Tags:owner,Tags:project,Template:Metadata.Build info.built from.origin,Template:Metadata.Build info.built from.file,Template:Metadata.Build info.url,Region")
 PARSER.add_argument("-i", "--input",
                     help="Skips json generation and AWS API calls and reads json directly for graph visualization, doesn't output markdown table")
 PARSER.add_argument("-o", "--output",
@@ -61,7 +63,7 @@ GRAPH_NODE_ID_TO_STACK_MAPPING = {}
 NODE_ID_COUNTER = count()
 
 
-def list_stacks_by_tags(client, tags: dict, region: str) -> list:
+def list_stacks_by_tags(client, tags: dict, region: str, include_templates: bool) -> list:
     """
     List CloudFormation stacks in a given region that match a list of tags.
 
@@ -136,6 +138,18 @@ def list_stacks_by_tags(client, tags: dict, region: str) -> list:
                 stack_details['Stacks'][0]['Imports'] = all_imports
                 stack_details['Stacks'][0]['Region'] = region
 
+                if include_templates:
+                    response = client.get_template(StackName=stack_name)
+                    template_body = response['TemplateBody']
+                    if isinstance(template_body, str):  # Template may be JSON or YAML
+                        try:
+                            template_dict = json.loads(template_body)
+                        except json.JSONDecodeError:
+                            template_dict = yaml.safe_load(template_body)
+                    else:
+                        template_dict = template_body  # Already a dict (e.g., generated inline templates)
+                    stack_details['Stacks'][0]['Template'] = template_dict
+
                 matching_stacks.append(stack_details['Stacks'][0])
                 logging.debug("Found matching stack %s with details '%s'", stack_name, stack_details)
 
@@ -147,7 +161,8 @@ def create_transformation_functions(outputs: list):
     transformations = []
     for output in outputs:
         if "Template" in output:
-            # TODO
+            key = output.split(":")[1]
+            transformations.append(lambda s, o=output, k=key: (o, functools.reduce(lambda c, i: c.get(i, "???") if isinstance(c, dict) else "???", k.split("."), s['Template'])))
             continue
         if "Tags:" in output:
             key = output.split(":")[1]
@@ -165,6 +180,7 @@ def create_cfn_node(name: str, graph_data: dict) -> str:
         {"id": node_id, "name": name, "image": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudFormation.svg", "type": "stack"}
     )
     return node_id
+
 
 def expand_stack_for_graph(stack, graph_data: dict) -> dict:
     """Transform stack details to json for the stack and its resources."""
@@ -198,14 +214,16 @@ def expand_stack_for_graph(stack, graph_data: dict) -> dict:
             )
     return graph_data
 
+
 def main():
     """Entry point for the application script."""
     tags = {key: value for key, value in map(lambda f: f.split(":"), ARGS.filter)}
+    include_template = any(h.startswith("Template:") for h in ARGS.headers.split(","))
     session = boto3.Session(profile_name=ARGS.profile)
     stacks = []
     for region in ARGS.regions:
         client = session.client('cloudformation', region_name=region)
-        stacks.extend(list_stacks_by_tags(client, tags, region))
+        stacks.extend(list_stacks_by_tags(client, tags, region, include_template))
 
     # Sort list by stack name to keep output consistent across runs
     stacks = sorted(stacks, key=lambda d: d['StackName'])
@@ -217,7 +235,6 @@ def main():
     for stack in stacks:
         expand_stack_for_graph(stack, graph_data)
         data = {key: value for transform in transformations for key, value in [transform(stack)]}
-        logging.info(data)
         table_data.append(data)
 
     # Output graph json
@@ -227,6 +244,7 @@ def main():
     # Output markdown table
     markdown = markdown_table(table_data).get_markdown()
     print(markdown)
+
 
 if __name__ == '__main__':
     main()

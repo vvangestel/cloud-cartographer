@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AWS Cloudformation Graph</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+        svg {
+            width: 100%;
+            height: 100%;
+        }
+        .node circle {
+            border-radius: 50%;
+        }
+        .link {
+            fill: none;
+            stroke: #aaa;
+            stroke-width: 2px;
+        }
+        .link-label {
+            font-size: 12px;
+            font-family: sans-serif;
+            text-anchor: middle;
+            fill: #333;
+        }
+        text {
+            font-size: 12px;
+            font-family: sans-serif;
+            text-anchor: middle;
+        }
+    </style>
+</head>
+<body>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script>
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        const svg = d3.select('body').append('svg')
+            .attr('width', width)
+            .attr('height', height);
+
+        svg.append('defs').append('marker')
+            .attr('id', 'arrowhead')
+            .attr('viewBox', '0 -5 10 10')  // Define the size of the arrowhead
+            .attr('refX', 30)  // Position where the arrowhead will be attached to the link
+            .attr('refY', 0)
+            .attr('orient', 'auto')
+            .attr('markerWidth', 3)
+            .attr('markerHeight', 3)
+            .append('path')
+            .attr('d', 'M0,-5L10,0L0,5')  // Path of the arrowhead
+            .attr('fill', '#aaa');  // Color of the arrowhead
+
+        // Load JSON data
+        d3.json('cloudformation_map.json').then(graph => {
+            const nodeCount = graph.nodes.length;
+            console.log(nodeCount)
+
+            // Scale node sizes and link distances based on the number of nodes
+            const nodeRadius = Math.max(6, Math.min(30, 100 / Math.sqrt(nodeCount))); // Radius decreases as nodeCount increases
+            const linkDistance = Math.max(80, Math.min(200, 500 / Math.sqrt(nodeCount))); // Adjust link distance similarly
+
+            const simulation = d3.forceSimulation(graph.nodes)
+                .force('link', d3.forceLink(graph.links).id(d => d.id).distance(d => {
+                    if (d.source.type === 'stack' && d.target.type === 'stack') {
+                       return 2 * linkDistance;
+                    }
+                    return linkDistance
+                }))
+                .force('charge', d3.forceManyBody().strength(-Math.max(150, 500 / Math.sqrt(nodeCount))))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('x', d3.forceX(width / 2).strength(0.1))
+                .force('y', d3.forceY(height / 2).strength(0.1));
+
+            // Wrap graph elements in a group
+            const container = svg.append('g');
+
+            const link = container.append('g')
+                .selectAll('.link')
+                .data(graph.links)
+                .enter().append('line')
+                .attr('class', 'link')
+                .attr('marker-end', 'url(#arrowhead)');
+
+            // Group links by source-target pair to handle multiple links between two nodes
+            const linkGroups = {};
+            graph.links.forEach((d) => {
+                const key = `${d.source.id}-${d.target.id}`;
+                if (!linkGroups[key]) linkGroups[key] = [];
+                linkGroups[key].push(d);
+            });
+
+            const linkLabel = container.append('g')
+                .selectAll('.link-label')
+                .data(graph.links)
+                .enter().append('text')
+                .attr('class', 'link-label')
+                .text(d => d.label || '')  // Use the label if it exists
+                .style('fill', '#333')
+                .filter(d => d.label)  // Only keep elements where there is a label
+                .style('visibility', 'visible')  // Ensure label visibility is set
+                .style('font-size', `${Math.max(6, nodeRadius / 5)}px`)
+                .style('text-anchor', 'middle');
+
+            const node = container.append('g')
+                .selectAll('.node')
+                .data(graph.nodes)
+                .enter().append('g')
+                .attr('class', 'node')
+                .call(d3.drag()
+                    .on('start', dragstart)
+                    .on('drag', dragged)
+                    .on('end', dragend));
+
+            node.each(function(d) {
+                if (d.type === 'stack') {
+                    // Render the CloudFormation stack node as an image (larger)
+                    d3.select(this).append('image')
+                        .attr('xlink:href', d.image)
+                        .attr('x', -nodeRadius * 2)  // Scale the image size dynamically
+                        .attr('y', -nodeRadius * 2)
+                        .attr('width', nodeRadius * 4)
+                        .attr('height', nodeRadius * 4);
+                } else {
+                    // Render the resource nodes as smaller circles with images
+                    d3.select(this).append('circle')
+                        .attr('r', nodeRadius)  // Adjust circle size dynamically
+                        .attr('fill', '#ffffff');  // Default color for resources
+
+                    d3.select(this).append('image')
+                        .attr('xlink:href', d.image)
+                        .attr('x', -nodeRadius)  // Adjust image position dynamically
+                        .attr('y', -nodeRadius)
+                        .attr('width', nodeRadius * 2)
+                        .attr('height', nodeRadius * 2)
+                        .attr('clip-path', 'url(#circle-clip)');
+                }
+            });
+
+            // Define the clip path to make images circular
+            svg.append('defs').append('clipPath')
+                .attr('id', 'circle-clip')
+                .append('circle')
+                .attr('r', nodeRadius)
+                .attr('cx', 0)
+                .attr('cy', 0);
+
+            // Add text labels for CFN stacks and resources
+            node.append('text')
+                .attr('x', 0) // Center the text horizontally relative to the node
+                .attr('y', d => d.type === 'stack' ? nodeRadius * 3.3 : nodeRadius * 2.3) // Dynamic vertical position
+                .text(d => d.name)
+                .attr('font-size', d => d.type === 'stack' ? `${Math.max(6, nodeRadius / 5)}px` : `${Math.max(4, nodeRadius / 5)}px`) // Proportional font size
+                .attr('fill', '#333')
+                .attr('text-anchor', 'middle'); // Center the text alignment
+
+
+            node.append('title')
+                .text(d => d.name);
+
+            // Function to calculate the label offset based on the number of links between nodes
+            function getLinkLabelOffset(link) {
+                const key = `${link.source.id}-${link.target.id}`;
+                const linksBetweenNodes = linkGroups[key];
+                const index = linksBetweenNodes.indexOf(link);  // Find the index of the current link
+                const offsetSpacing = 6;  // Space between labels (adjust as needed)
+
+                // Distribute labels evenly along the link axis
+                return {
+                    x: 0,
+                    y: index * offsetSpacing - (linksBetweenNodes.length - 1) * offsetSpacing / 2,  // Center labels for multiple links
+                };
+            }
+
+            simulation.on('tick', function() {
+                link
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+
+                linkLabel
+                    .attr('x', d => {
+                        const offset = getLinkLabelOffset(d);  // Get offset based on multiple links
+                        return (d.source.x + d.target.x) / 2 + offset.x;
+                    })
+                    .attr('y', d => {
+                        const offset = getLinkLabelOffset(d);  // Get offset based on multiple links
+                        return (d.source.y + d.target.y) / 2 + offset.y;
+                    });
+
+                node
+                    .attr('transform', d => {
+                        return `translate(${d.x},${d.y})`;
+                    });
+            });
+
+            function dragstart(event, d) {
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+
+            function dragend(event, d) {
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }
+
+            const zoom = d3.zoom()
+                .scaleExtent([0.1, 10]) // Zoom range
+                .on('zoom', (event) => {
+                    container.attr('transform', event.transform);
+                });
+
+            svg.call(zoom);
+
+            // Function to update the canvas size and recalculate layout
+            function resize() {
+                const newWidth = window.innerWidth;
+                const newHeight = window.innerHeight;
+
+                // Update SVG dimensions
+                svg.attr('width', newWidth).attr('height', newHeight);
+
+                // Update the force center
+                simulation.force('center', d3.forceCenter(newWidth / 2, newHeight / 2));
+
+                // Restart the simulation to apply changes
+                simulation.alpha(1).restart();
+
+                // Ensure nodes stay within new bounds
+                simulation.on('tick', function() {
+                    link
+                        .attr('x1', d => d.source.x)
+                        .attr('y1', d => d.source.y)
+                        .attr('x2', d => d.target.x)
+                        .attr('y2', d => d.target.y);
+
+                    node
+                        .attr('transform', d => {
+                            d.x = Math.max(nodeRadius, Math.min(newWidth - nodeRadius, d.x));
+                            d.y = Math.max(nodeRadius, Math.min(newHeight - nodeRadius, d.y));
+                            return `translate(${d.x},${d.y})`;
+                        });
+                });
+            }
+
+            // Add event listener for window resize
+            window.addEventListener('resize', resize);
+
+        }).catch(error => {
+            console.error('Error loading the JSON file:', error);
+        });
+    </script>
+</body>
+</html>
