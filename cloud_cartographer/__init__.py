@@ -242,7 +242,7 @@ def main():
         outfile.write(json.dumps(graph_data))
 
     # Output markdown table
-    markdown = markdown_table(table_data).get_markdown()
+    markdown = markdown_table(table_data).set_params(row_sep = 'markdown', quote = False).get_markdown()
     print(markdown)
 
 
