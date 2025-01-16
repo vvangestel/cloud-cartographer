@@ -5,11 +5,14 @@ Main entrypoint module for the ccarto tool.
 """
 import argparse
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
+from concurrent.futures import ThreadPoolExecutor
 import functools
 from itertools import count
 import json
 import logging
+import time
 import yaml
 
 from py_markdown_table.markdown_table import markdown_table
@@ -35,6 +38,9 @@ PARSER.add_argument("-i", "--input",
 PARSER.add_argument("-o", "--output",
                     help="Filename to output json graph data to",
                     default="cloudformation_map.json")
+PARSER.add_argument("-t", "--threads",
+                    help="Number of threads to spawn when crawling parsing cloudformation stacks",
+                    default=16)
 PARSER.add_argument("-v", "--verbose",
                     help="Print more information",
                     action="store_true",
@@ -49,6 +55,7 @@ RESOURCE_TYPE_MAPPING = {
     "ApiGatewayV2": "https://icon.icepanel.io/AWS/svg/App-Integration/API-Gateway.svg",
     "ApplicationAutoScaling": "https://icon.icepanel.io/AWS/svg/Compute/Application-Auto-Scaling.svg",
     "CloudWatch": "https://icon.icepanel.io/AWS/svg/Management-Governance/CloudWatch.svg",
+    "CloudFront": "https://icon.icepanel.io/AWS/svg/Networking-Content-Delivery/CloudFront.svg",
     "DynamoDB": "https://icon.icepanel.io/AWS/svg/Database/DynamoDB.svg",
     "EC2": "https://icon.icepanel.io/AWS/svg/Compute/EC2.svg",
     "Events": "https://icon.icepanel.io/AWS/svg/App-Integration/EventBridge.svg",
@@ -61,6 +68,72 @@ RESOURCE_TYPE_MAPPING = {
 
 GRAPH_NODE_ID_TO_STACK_MAPPING = {}
 NODE_ID_COUNTER = count()
+
+def process_stack(client, tags: dict, region: str, include_templates: bool, stack_summary, matching_stacks: list):
+    stack_name = stack_summary['StackName']
+
+    # Get stack details to retrieve tags
+    stack_details = client.describe_stacks(StackName=stack_name)
+    stack_tags = stack_details['Stacks'][0].get('Tags', [])
+
+    # Convert stack tags to a dictionary
+    stack_tags_dict = {tag['Key']: tag['Value'] for tag in stack_tags}
+
+    # Check if stack tags match the required tags
+    if all(stack_tags_dict.get(k) == v for k, v in tags.items()):
+        all_resources = []
+        next_token = None
+        while True:
+            if next_token:
+                response = client.list_stack_resources(StackName=stack_name, NextToken=next_token)
+            else:
+                response = client.list_stack_resources(StackName=stack_name)
+            all_resources.extend(response['StackResourceSummaries'])
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+        stack_details['Stacks'][0]['Resources'] = all_resources
+
+        all_imports = {}
+        for output in stack_details['Stacks'][0].get("Outputs", []):
+            export = output.get("ExportName", None)
+            if not export:
+                continue
+            all_imports[export] = []
+            next_token = None
+            while True:
+                try:
+                    if next_token:
+                        response = client.list_imports(ExportName=export, NextToken=next_token)
+                    else:
+                        response = client.list_imports(ExportName=export)
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'ValidationError':
+                        logging.debug(f"Export '{export}' is not imported by any stack")
+                        break
+                    else:
+                        raise e
+                all_imports[export].extend(response['Imports'])
+                next_token = response.get('NextToken')
+                if not next_token:
+                    break
+        stack_details['Stacks'][0]['Imports'] = all_imports
+        stack_details['Stacks'][0]['Region'] = region
+
+        if include_templates:
+            response = client.get_template(StackName=stack_name)
+            template_body = response['TemplateBody']
+            if isinstance(template_body, str):  # Template may be JSON or YAML
+                try:
+                    template_dict = json.loads(template_body)
+                except json.JSONDecodeError:
+                    template_dict = yaml.safe_load(template_body)
+            else:
+                template_dict = template_body  # Already a dict (e.g., generated inline templates)
+            stack_details['Stacks'][0]['Template'] = template_dict
+
+        matching_stacks.append(stack_details['Stacks'][0])
+        logging.debug("Found matching stack %s with details '%s'", stack_name, stack_details)
 
 
 def list_stacks_by_tags(client, tags: dict, region: str, include_templates: bool) -> list:
@@ -85,74 +158,15 @@ def list_stacks_by_tags(client, tags: dict, region: str, include_templates: bool
 
     matching_stacks = []
 
+    executor = ThreadPoolExecutor(max_workers=int(ARGS.threads), thread_name_prefix="crawler")
+    work_list = []
+
     logging.info("Processing stacks from region: '%s'", region)
     for page in response_iterator:
-        for stack_summary in page['StackSummaries']:
-            stack_name = stack_summary['StackName']
+        work_list.extend([executor.submit(process_stack, client, tags, region, include_templates, stack_summary, matching_stacks) for stack_summary in page['StackSummaries']])
 
-            # Get stack details to retrieve tags
-            stack_details = client.describe_stacks(StackName=stack_name)
-            stack_tags = stack_details['Stacks'][0].get('Tags', [])
-
-            # Convert stack tags to a dictionary
-            stack_tags_dict = {tag['Key']: tag['Value'] for tag in stack_tags}
-
-            # Check if stack tags match the required tags
-            if all(stack_tags_dict.get(k) == v for k, v in tags.items()):
-                all_resources = []
-                next_token = None
-                while True:
-                    if next_token:
-                        response = client.list_stack_resources(StackName=stack_name, NextToken=next_token)
-                    else:
-                        response = client.list_stack_resources(StackName=stack_name)
-                    all_resources.extend(response['StackResourceSummaries'])
-                    next_token = response.get('NextToken')
-                    if not next_token:
-                        break
-                stack_details['Stacks'][0]['Resources'] = all_resources
-
-                all_imports = {}
-                for output in stack_details['Stacks'][0].get("Outputs", []):
-                    export = output.get("ExportName", None)
-                    if not export:
-                        continue
-                    all_imports[export] = []
-                    next_token = None
-                    while True:
-                        try:
-                            if next_token:
-                                response = client.list_imports(ExportName=export, NextToken=next_token)
-                            else:
-                                response = client.list_imports(ExportName=export)
-                        except ClientError as e:
-                            if e.response['Error']['Code'] == 'ValidationError':
-                                logging.debug(f"Export '{export}' is not imported by any stack")
-                                break
-                            else:
-                                raise e
-                        all_imports[export].extend(response['Imports'])
-                        next_token = response.get('NextToken')
-                        if not next_token:
-                            break
-                stack_details['Stacks'][0]['Imports'] = all_imports
-                stack_details['Stacks'][0]['Region'] = region
-
-                if include_templates:
-                    response = client.get_template(StackName=stack_name)
-                    template_body = response['TemplateBody']
-                    if isinstance(template_body, str):  # Template may be JSON or YAML
-                        try:
-                            template_dict = json.loads(template_body)
-                        except json.JSONDecodeError:
-                            template_dict = yaml.safe_load(template_body)
-                    else:
-                        template_dict = template_body  # Already a dict (e.g., generated inline templates)
-                    stack_details['Stacks'][0]['Template'] = template_dict
-
-                matching_stacks.append(stack_details['Stacks'][0])
-                logging.debug("Found matching stack %s with details '%s'", stack_name, stack_details)
-
+    for future in work_list:
+        future.result()
     return matching_stacks
 
 
@@ -221,9 +235,12 @@ def main():
     include_template = any(h.startswith("Template:") for h in ARGS.headers.split(","))
     session = boto3.Session(profile_name=ARGS.profile)
     stacks = []
+
     for region in ARGS.regions:
-        client = session.client('cloudformation', region_name=region)
+        start_time = time.time()
+        client = session.client('cloudformation', region_name=region, config=Config(retries={'mode': 'adaptive', 'max_attempts': 5}))
         stacks.extend(list_stacks_by_tags(client, tags, region, include_template))
+        logging.info("Finished collecting stack info in %s! Elapsed time since start %s", region, time.strftime('%Mm%Ss', time.gmtime(time.time() - start_time)))
 
     # Sort list by stack name to keep output consistent across runs
     stacks = sorted(stacks, key=lambda d: d['StackName'])
@@ -244,7 +261,6 @@ def main():
     # Output markdown table
     markdown = markdown_table(table_data).set_params(row_sep = 'markdown', quote = False).get_markdown()
     print(markdown)
-
 
 if __name__ == '__main__':
     main()
