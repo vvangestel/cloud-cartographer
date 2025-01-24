@@ -6,10 +6,12 @@ Main entrypoint module for the ccarto tool.
 import argparse
 import boto3
 from botocore.exceptions import ClientError
+from datetime import datetime
 import functools
 from itertools import count
 import json
 import logging
+import urllib.parse
 import yaml
 
 from py_markdown_table.markdown_table import markdown_table
@@ -35,6 +37,9 @@ PARSER.add_argument("-i", "--input",
 PARSER.add_argument("-o", "--output",
                     help="Filename to output json graph data to",
                     default="cloudformation_map.json")
+PARSER.add_argument("-t", "--title",
+                    help="Title of markdown output",
+                    default="Cloud Cartographer Table")
 PARSER.add_argument("-v", "--verbose",
                     help="Print more information",
                     action="store_true",
@@ -235,6 +240,8 @@ def main():
     for stack in stacks:
         expand_stack_for_graph(stack, graph_data)
         data = {key: value for transform in transformations for key, value in [transform(stack)]}
+        if('StackName' in data):
+            data['StackName'] = f"[{data['StackName']}](https://{stack['Region']}.console.aws.amazon.com/cloudformation/home?region={stack['Region']}#/stacks/stackinfo?stackId={urllib.parse.quote_plus(stack['StackId'])})"
         table_data.append(data)
 
     # Output graph json
@@ -243,6 +250,9 @@ def main():
 
     # Output markdown table
     markdown = markdown_table(table_data).set_params(row_sep = 'markdown', quote = False).get_markdown()
+    print(f"# {ARGS.title}")
+    print(f"*Generated on {datetime.now()} by [Cloud Cartographer](https://pypi.org/project/cloud-cartographer/)*")
+    print()
     print(markdown)
 
 

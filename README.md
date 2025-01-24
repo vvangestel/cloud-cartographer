@@ -52,6 +52,7 @@ ccarto [-h] [-p PROFILE] [-r REGIONS [REGIONS ...]] [-f FILTER [FILTER ...]] [--
 - `--headers HEADERS`: Custom headers for markdown table output
 - `-i, --input INPUT`: Skip AWS API calls and use existing JSON data for visualization
 - `-o, --output OUTPUT`: Specify output filename for JSON graph data (defaults to `cloudformation_map.json`)
+- `-t, --title TITLE`: Specify title of generated markdown document (defaults to `Cloud Cartographer Table`)
 - `-v, --verbose`: Enable verbose output
 
 ### Examples
