@@ -26,7 +26,7 @@ PARSER.add_argument("-r", "--regions",
                     nargs="+",
                     default=[])
 PARSER.add_argument("-f", "--filter",
-                    help="Tags to filter on, format should be as follows: Key:Value",
+                    help="Tags to filter on, format should be as follows: Key:Value1,Value2,...",
                     nargs="+",
                     default=[])
 PARSER.add_argument("--headers",
@@ -68,7 +68,7 @@ GRAPH_NODE_ID_TO_STACK_MAPPING = {}
 NODE_ID_COUNTER = count()
 
 
-def list_stacks_by_tags(client, tags: dict, region: str, include_templates: bool) -> list:
+def list_stacks_by_tags(session, region: str, include_templates: bool) -> list:
     """
     List CloudFormation stacks in a given region that match a list of tags.
 
@@ -76,87 +76,92 @@ def list_stacks_by_tags(client, tags: dict, region: str, include_templates: bool
     :param tags: A dictionary of tag keys and values to filter stacks (e.g., {"Environment": "Prod"}).
     :return: A list of stack names that match the tags.
     """
-    logging.info("Listing stacks in region '%s'", region)
-    # Get all stacks (exclude deleted or otherwise non-existent stacks)
-    paginator = client.get_paginator('list_stacks')
-    response_iterator = paginator.paginate(
-        StackStatusFilter=[
-            "CREATE_COMPLETE", "ROLLBACK_IN_PROGRESS", "ROLLBACK_FAILED", "ROLLBACK_COMPLETE", "DELETE_FAILED",
-            "UPDATE_IN_PROGRESS", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", "UPDATE_COMPLETE", "UPDATE_FAILED",
-            "UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_FAILED", "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
-            "UPDATE_ROLLBACK_COMPLETE",
-        ]
+    resourcegroups_client = session.client('resourcegroupstaggingapi', region_name=region)
+    cloudformation_client = session.client('cloudformation', region_name=region)
+
+    tag_filters = [
+        {
+            'Key': key,
+            'Values': values.split(","),
+        } for key, values in map(lambda f: f.split(":"), ARGS.filter)
+    ]
+    response = resourcegroups_client.get_resources(
+        TagFilters=tag_filters,
+        ResourceTypeFilters=['cloudformation:stack'],
+        ResourcesPerPage=100
     )
 
     matching_stacks = []
 
     logging.info("Processing stacks from region: '%s'", region)
-    for page in response_iterator:
-        for stack_summary in page['StackSummaries']:
-            stack_name = stack_summary['StackName']
+    while True:
+        for resource in response['ResourceTagMappingList']:
+            stack_arn = resource['ResourceARN']
 
-            # Get stack details to retrieve tags
-            stack_details = client.describe_stacks(StackName=stack_name)
-            stack_tags = stack_details['Stacks'][0].get('Tags', [])
+            stack_details = cloudformation_client.describe_stacks(StackName=stack_arn)
+            all_resources = []
+            next_token = None
+            while True:
+                if next_token:
+                    response = cloudformation_client.list_stack_resources(StackName=stack_arn, NextToken=next_token)
+                else:
+                    response = cloudformation_client.list_stack_resources(StackName=stack_arn)
+                all_resources.extend(response['StackResourceSummaries'])
+                next_token = response.get('NextToken')
+                if not next_token:
+                    break
+            stack_details['Stacks'][0]['Resources'] = all_resources
 
-            # Convert stack tags to a dictionary
-            stack_tags_dict = {tag['Key']: tag['Value'] for tag in stack_tags}
-
-            # Check if stack tags match the required tags
-            if all(stack_tags_dict.get(k) == v for k, v in tags.items()):
-                all_resources = []
+            all_imports = {}
+            for output in stack_details['Stacks'][0].get("Outputs", []):
+                export = output.get("ExportName", None)
+                if not export:
+                    continue
+                all_imports[export] = []
                 next_token = None
                 while True:
-                    if next_token:
-                        response = client.list_stack_resources(StackName=stack_name, NextToken=next_token)
-                    else:
-                        response = client.list_stack_resources(StackName=stack_name)
-                    all_resources.extend(response['StackResourceSummaries'])
+                    try:
+                        if next_token:
+                            response = cloudformation_client.list_imports(ExportName=export, NextToken=next_token)
+                        else:
+                            response = cloudformation_client.list_imports(ExportName=export)
+                    except ClientError as e:
+                        if e.response['Error']['Code'] == 'ValidationError':
+                            logging.debug(f"Export '{export}' is not imported by any stack")
+                            break
+                        else:
+                            raise e
+                    all_imports[export].extend(response['Imports'])
                     next_token = response.get('NextToken')
                     if not next_token:
                         break
-                stack_details['Stacks'][0]['Resources'] = all_resources
+            stack_details['Stacks'][0]['Imports'] = all_imports
+            stack_details['Stacks'][0]['Region'] = region
 
-                all_imports = {}
-                for output in stack_details['Stacks'][0].get("Outputs", []):
-                    export = output.get("ExportName", None)
-                    if not export:
-                        continue
-                    all_imports[export] = []
-                    next_token = None
-                    while True:
-                        try:
-                            if next_token:
-                                response = client.list_imports(ExportName=export, NextToken=next_token)
-                            else:
-                                response = client.list_imports(ExportName=export)
-                        except ClientError as e:
-                            if e.response['Error']['Code'] == 'ValidationError':
-                                logging.debug(f"Export '{export}' is not imported by any stack")
-                                break
-                            else:
-                                raise e
-                        all_imports[export].extend(response['Imports'])
-                        next_token = response.get('NextToken')
-                        if not next_token:
-                            break
-                stack_details['Stacks'][0]['Imports'] = all_imports
-                stack_details['Stacks'][0]['Region'] = region
+            if include_templates:
+                response = cloudformation_client.get_template(StackName=stack_arn)
+                template_body = response['TemplateBody']
+                if isinstance(template_body, str):  # Template may be JSON or YAML
+                    try:
+                        template_dict = json.loads(template_body)
+                    except json.JSONDecodeError:
+                        template_dict = yaml.safe_load(template_body)
+                else:
+                    template_dict = template_body  # Already a dict (e.g., generated inline templates)
+                stack_details['Stacks'][0]['Template'] = template_dict
 
-                if include_templates:
-                    response = client.get_template(StackName=stack_name)
-                    template_body = response['TemplateBody']
-                    if isinstance(template_body, str):  # Template may be JSON or YAML
-                        try:
-                            template_dict = json.loads(template_body)
-                        except json.JSONDecodeError:
-                            template_dict = yaml.safe_load(template_body)
-                    else:
-                        template_dict = template_body  # Already a dict (e.g., generated inline templates)
-                    stack_details['Stacks'][0]['Template'] = template_dict
+            matching_stacks.append(stack_details['Stacks'][0])
+            logging.debug("Found matching stack %s with details '%s'", stack_arn, stack_details)
 
-                matching_stacks.append(stack_details['Stacks'][0])
-                logging.debug("Found matching stack %s with details '%s'", stack_name, stack_details)
+        # Handle pagination if needed
+        if 'PaginationToken' in response and response['PaginationToken']:
+            response = resourcegroups_client.get_resources(
+                PaginationToken=response['PaginationToken'],
+                TagFilters=tag_filters,
+                ResourceTypeFilters=['cloudformation:stack']
+            )
+        else:
+            break
 
     return matching_stacks
 
@@ -222,13 +227,11 @@ def expand_stack_for_graph(stack, graph_data: dict) -> dict:
 
 def main():
     """Entry point for the application script."""
-    tags = {key: value for key, value in map(lambda f: f.split(":"), ARGS.filter)}
     include_template = any(h.startswith("Template:") for h in ARGS.headers.split(","))
     session = boto3.Session(profile_name=ARGS.profile)
     stacks = []
     for region in ARGS.regions:
-        client = session.client('cloudformation', region_name=region)
-        stacks.extend(list_stacks_by_tags(client, tags, region, include_template))
+        stacks.extend(list_stacks_by_tags(session, region, include_template))
 
     # Sort list by stack name to keep output consistent across runs
     stacks = sorted(stacks, key=lambda d: d['StackName'])
