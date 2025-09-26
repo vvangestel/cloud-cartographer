@@ -33,10 +33,13 @@ PARSER.add_argument("--headers",
                     help="Output format for markdown table result, string separated",
                     default="StackName,LastUpdatedTime,Tags:owner,Tags:project,Template:Metadata.Build info.built from.origin,Template:Metadata.Build info.built from.file,Template:Metadata.Build info.url,Region")
 PARSER.add_argument("-i", "--input",
-                    help="Skips json generation and AWS API calls and reads json directly for graph visualization, doesn't output markdown table")
-PARSER.add_argument("-o", "--output",
+                    help="Skips json generation and AWS API calls and reads json directly for graph visualization")
+PARSER.add_argument("-j", "--json",
                     help="Filename to output json graph data to",
                     default="cloudformation_map.json")
+PARSER.add_argument("-o", "--output",
+                    help="Filename to output readme file to",
+                    default="README.md")
 PARSER.add_argument("-t", "--title",
                     help="Title of markdown output",
                     default="Cloud Cartographer Table")
@@ -243,20 +246,21 @@ def main():
     for stack in stacks:
         expand_stack_for_graph(stack, graph_data)
         data = {key: value for transform in transformations for key, value in [transform(stack)]}
-        if('StackName' in data):
+        if 'StackName' in data:
             data['StackName'] = f"[{data['StackName']}](https://{stack['Region']}.console.aws.amazon.com/cloudformation/home?region={stack['Region']}#/stacks/stackinfo?stackId={urllib.parse.quote_plus(stack['StackId'])})"
         table_data.append(data)
 
     # Output graph json
-    with open(ARGS.output, "w") as outfile:
+    with open(ARGS.json, "w") as outfile:
         outfile.write(json.dumps(graph_data))
 
     # Output markdown table
-    markdown = markdown_table(table_data).set_params(row_sep = 'markdown', quote = False).get_markdown()
-    print(f"# {ARGS.title}")
-    print(f"*Generated on {datetime.now()} by [Cloud Cartographer](https://pypi.org/project/cloud-cartographer/)*")
-    print()
-    print(markdown)
+    with open(ARGS.output, "w") as outfile:
+        outfile.write(f"# {ARGS.title}\n")
+        outfile.write(f"*Generated on {datetime.now()} by [Cloud Cartographer](https://pypi.org/project/cloud-cartographer/)*\n\n")
+        markdown = markdown_table(table_data).set_params(row_sep='markdown', quote=False).get_markdown()
+        outfile.write(markdown)
+        outfile.write("\n")
 
 
 if __name__ == '__main__':

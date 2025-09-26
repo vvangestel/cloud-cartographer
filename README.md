@@ -41,17 +41,18 @@ Note: PyPI installation will be available in future releases.
 The basic command structure is:
 ```bash
 ccarto [-h] [-p PROFILE] [-r REGIONS [REGIONS ...]] [-f FILTER [FILTER ...]] [--headers HEADERS] [-i INPUT]
-       [-o OUTPUT] [-v]
+       [-j JSON] [-o OUTPUT] [-v]
 ```
 
 ### Command Line Options
 
 - `-p, --profile PROFILE`: Specify the AWS profile to use
 - `-r, --regions REGIONS [REGIONS ...]`: Specify one or more AWS regions to scan
-- `-f, --filter FILTER [FILTER ...]`: Filter stacks by tags (format: Key:Value)
+- `-f, --filter FILTER [FILTER ...]`: Filter stacks by tags (format: Key:Value1,Value2,Value3,...)
 - `--headers HEADERS`: Custom headers for markdown table output
 - `-i, --input INPUT`: Skip AWS API calls and use existing JSON data for visualization
-- `-o, --output OUTPUT`: Specify output filename for JSON graph data (defaults to `cloudformation_map.json`)
+- `-j, --json JSON`: Specify output filename for JSON graph data (defaults to `cloudformation_map.json`)
+- `-o, --output OUTPUT`: Specify output filename for README file (defaults to `README.md`)
 - `-t, --title TITLE`: Specify title of generated markdown document (defaults to `Cloud Cartographer Table`)
 - `-v, --verbose`: Enable verbose output
 
